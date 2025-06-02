@@ -30,6 +30,13 @@ class RelayConfig:
     enable_stop: bool = True  # Whether to accept relayed connections (stop)
     enable_client: bool = True  # Whether to use relays for dialing
 
+    # Hole punching configuration
+    enable_hole_punching: bool = (
+        True  # Whether to attempt NAT traversal via hole punching
+    )
+    max_hole_punch_attempts: int = 3  # Maximum number of hole punch attempts
+    hole_punch_retry_interval: float = 5.0  # Time between hole punch retries (seconds)
+
     # Resource limits
     limits: Optional[RelayLimits] = None
 
@@ -95,3 +102,10 @@ class ClientConfig:
     # Reservation management
     reservation_refresh_threshold: float = 0.8  # Refresh at 80% of TTL
     max_concurrent_reservations: int = 2
+
+    # Hole punching settings
+    enable_hole_punching: bool = True
+    hole_punch_timeout: int = 30  # seconds
+    prefer_direct_connections: bool = (
+        True  # Whether to prefer direct connections over relayed ones
+    )

@@ -47,6 +47,16 @@ from libp2p.peer.id import (
 from libp2p.peer.peerstore import (
     PeerStore,
 )
+from libp2p.relay.circuit_v2 import (
+    CircuitV2Protocol,
+    CircuitV2Transport,
+    DCUtRProtocol,
+    ReachabilityChecker,
+)
+from libp2p.relay.circuit_v2 import (
+    DCUTR_PROTOCOL_ID,
+)
+from libp2p.relay.circuit_v2 import PROTOCOL_ID as CIRCUIT_V2_PROTOCOL_ID
 from libp2p.security.insecure.transport import (
     PLAINTEXT_PROTOCOL_ID,
     InsecureTransport,
@@ -243,6 +253,8 @@ def new_host(
     disc_opt: Optional[IPeerRouting] = None,
     muxer_preference: Optional[Literal["YAMUX", "MPLEX"]] = None,
     listen_addrs: Sequence[multiaddr.Multiaddr] = None,
+    enable_relay: bool = True,
+    enable_hole_punching: bool = True,
 ) -> IHost:
     """
     Create a new libp2p host based on the given parameters.
@@ -254,6 +266,8 @@ def new_host(
     :param disc_opt: optional discovery
     :param muxer_preference: optional explicit muxer preference
     :param listen_addrs: optional list of multiaddrs to listen on
+    :param enable_relay: whether to enable relay support
+    :param enable_hole_punching: whether to enable NAT traversal via hole punching
     :return: return a host instance
     """
     swarm = new_swarm(
@@ -265,9 +279,39 @@ def new_host(
         listen_addrs=listen_addrs,
     )
 
-    if disc_opt is not None:
-        return RoutedHost(swarm, disc_opt)
-    return BasicHost(swarm)
+    host = RoutedHost(swarm, disc_opt) if disc_opt is not None else BasicHost(swarm)
+
+    if enable_relay or enable_hole_punching:
+        # Set up Circuit Relay v2 with optional hole punching
+        from libp2p.relay.circuit_v2.config import (
+            RelayConfig,
+        )
+
+        relay_config = RelayConfig(
+            enable_client=True,
+            enable_hole_punching=enable_hole_punching,
+        )
+
+        # Create and start the relay protocol
+        relay_protocol = CircuitV2Protocol(
+            host=host,
+            allow_hop=False,  # Client mode only by default
+        )
+
+        # Create the relay transport with the protocol
+        relay_transport = CircuitV2Transport(
+            host=host,
+            protocol=relay_protocol,
+            config=relay_config,
+        )
+
+        # Start the relay protocol in the host's nursery
+        host.get_network().start_service(relay_protocol)
+
+        # TODO: Add the relay transport to the swarm's transports
+        # This would require extending the swarm API to allow adding transports after creation
+
+    return host
 
 
 __version__ = __version("libp2p")

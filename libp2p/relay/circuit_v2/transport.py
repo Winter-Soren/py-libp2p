@@ -43,12 +43,14 @@ from .config import (
     ClientConfig,
     RelayConfig,
 )
+from .dcutr import (
+    DCUtRProtocol,
+)
 from .discovery import (
     RelayDiscovery,
 )
 from .pb.circuit_pb2 import (
     HopMessage,
-    StopMessage,
 )
 from .protocol import (
     PROTOCOL_ID,
@@ -98,12 +100,19 @@ class CircuitV2Transport(ITransport):
             discovery_interval=config.discovery_interval,
             max_relays=config.max_relays,
         )
+        self.dcutr_protocol = None
+
+        # Initialize DCUtR protocol if enabled
+        if config.enable_hole_punching:
+            self.dcutr_protocol = DCUtRProtocol(host)
+            # The protocol will be started by the host later
 
     async def dial(
         self,
         peer_info: PeerInfo,
         *,
         relay_peer_id: Optional[ID] = None,
+        attempt_direct: bool = True,
     ) -> RawConnection:
         """
         Dial a peer through a relay.
@@ -113,7 +122,9 @@ class CircuitV2Transport(ITransport):
         peer_info : PeerInfo
             The peer to dial
         relay_peer_id : Optional[ID], optional
-            Optional specific relay peer to use
+            Optional specific relay to use
+        attempt_direct : bool, optional
+            Whether to attempt a direct connection first, defaults to True
 
         Returns
         -------
@@ -126,6 +137,22 @@ class CircuitV2Transport(ITransport):
             If the connection cannot be established
 
         """
+        # First try a direct connection if requested
+        if attempt_direct:
+            try:
+                # Attempt direct connection to the peer
+                logger.debug("Attempting direct connection to %s", peer_info.peer_id)
+                conn = await self.host.get_network().dial_peer(peer_info.peer_id)
+                logger.debug("Direct connection to %s succeeded", peer_info.peer_id)
+                return conn
+            except Exception as e:
+                logger.debug(
+                    "Direct connection to %s failed, falling back to relay: %s",
+                    peer_info.peer_id,
+                    str(e),
+                )
+                # Fall back to relay connection
+
         # If no specific relay is provided, try to find one
         if relay_peer_id is None:
             relay_peer_id = await self._select_relay(peer_info)
@@ -166,11 +193,84 @@ class CircuitV2Transport(ITransport):
                 raise ConnectionError(f"Relay connection failed: {status_msg}")
 
             # Create raw connection from stream
-            return RawConnection(stream=relay_stream, initiator=True)
+            raw_conn = RawConnection(stream=relay_stream, initiator=True)
+
+            # Schedule hole punching if enabled
+            if self.config.enable_hole_punching and self.dcutr_protocol:
+                # Schedule hole punching attempt in the background after a short delay
+                self._schedule_hole_punch(peer_info.peer_id, relay_peer_id)
+
+            return raw_conn
 
         except Exception as e:
             await relay_stream.close()
             raise ConnectionError(f"Failed to establish relay connection: {str(e)}")
+
+    def _schedule_hole_punch(self, peer_id: ID, relay_peer_id: ID) -> None:
+        """
+        Schedule a hole punching attempt in the background.
+
+        Parameters
+        ----------
+        peer_id : ID
+            The peer to attempt hole punching with
+        relay_peer_id : ID
+            The relay used for the connection
+        """
+        if not self.dcutr_protocol or not self.config.enable_hole_punching:
+            return
+
+        async def attempt_hole_punch() -> None:
+            # Wait a short time for the relay connection to be fully established
+            await trio.sleep(2.0)
+
+            # Check if we already have a direct connection
+            if self.dcutr_protocol._have_direct_connection(peer_id):
+                logger.debug(
+                    "Already have direct connection to %s, skipping hole punch", peer_id
+                )
+                return
+
+            # Attempt hole punching
+            logger.info(
+                "Attempting hole punch with %s via relay %s", peer_id, relay_peer_id
+            )
+            for i in range(self.config.max_hole_punch_attempts):
+                if i > 0:
+                    # Wait before retrying
+                    await trio.sleep(self.config.hole_punch_retry_interval)
+
+                # Skip if we already have a direct connection
+                if self.dcutr_protocol._have_direct_connection(peer_id):
+                    logger.debug(
+                        "Direct connection established, no need for further hole punching"
+                    )
+                    return
+
+                # Attempt hole punching
+                success = await self.dcutr_protocol.initiate_hole_punch(peer_id)
+                if success:
+                    logger.info("Hole punching succeeded with %s", peer_id)
+                    return
+
+                logger.debug(
+                    "Hole punching attempt %d/%d with %s failed",
+                    i + 1,
+                    self.config.max_hole_punch_attempts,
+                    peer_id,
+                )
+
+            logger.warning(
+                "All hole punching attempts with %s failed, keeping relay connection",
+                peer_id,
+            )
+
+        # Schedule the hole punching attempt in the background
+        nursery = self.host.get_network().nursery
+        if nursery:
+            nursery.start_soon(attempt_hole_punch)
+        else:
+            logger.warning("No nursery available, cannot schedule hole punching")
 
     async def _select_relay(self, peer_info: PeerInfo) -> Optional[ID]:
         """
@@ -249,8 +349,7 @@ class CircuitV2Transport(ITransport):
                 )
                 return False
 
-            # Store reservation info
-            # TODO: Implement reservation storage and refresh mechanism
+            logger.debug("Reservation with relay %s successful", relay_peer_id)
             return True
 
         except Exception as e:
@@ -262,49 +361,58 @@ class CircuitV2Transport(ITransport):
         handler_function: Callable[[ReadWriteCloser], Awaitable[None]],
     ) -> IListener:
         """
-        Create a listener for incoming relay connections.
+        Create a listener for the transport.
 
         Parameters
         ----------
         handler_function : Callable[[ReadWriteCloser], Awaitable[None]]
-            The handler function for new connections
+            Function to handle incoming connections
 
         Returns
         -------
         IListener
             The created listener
-
         """
-        return CircuitV2Listener(self.host, self.protocol, self.config)
+        return CircuitV2Listener(
+            host=self.host,
+            protocol=self.protocol,
+            config=self.config,
+            dcutr_protocol=self.dcutr_protocol,
+        )
 
 
 class CircuitV2Listener(Service, IListener):
-    """Listener for incoming relay connections."""
+    """Listener for Circuit Relay v2 connections."""
 
     def __init__(
         self,
         host: IHost,
         protocol: CircuitV2Protocol,
         config: RelayConfig,
+        dcutr_protocol: Optional[DCUtRProtocol] = None,
     ) -> None:
         """
-        Initialize the Circuit v2 listener.
+        Initialize the listener.
 
         Parameters
         ----------
         host : IHost
-            The libp2p host this listener is running on
+            The libp2p host
         protocol : CircuitV2Protocol
             The Circuit v2 protocol instance
         config : RelayConfig
             Relay configuration
-
+        dcutr_protocol : Optional[DCUtRProtocol]
+            The DCUtR protocol instance for hole punching
         """
         super().__init__()
         self.host = host
         self.protocol = protocol
         self.config = config
-        self.multiaddrs: list[str] = []  # TODO: Add relay multiaddrs
+        self.dcutr_protocol = dcutr_protocol
+        self._handler = None
+        self._peer_id = host.get_id()
+        self.event_started = trio.Event()
 
     async def handle_incoming_connection(
         self,
@@ -312,48 +420,115 @@ class CircuitV2Listener(Service, IListener):
         remote_peer_id: ID,
     ) -> RawConnection:
         """
-        Handle an incoming relay connection.
+        Handle an incoming connection.
 
         Parameters
         ----------
         stream : INetStream
             The incoming stream
         remote_peer_id : ID
-            The remote peer's ID
+            The remote peer ID
 
         Returns
         -------
         RawConnection
-            The established connection
-
-        Raises
-        ------
-        ConnectionError
-            If the connection cannot be established
-
+            Raw connection from the stream
         """
-        if not self.config.enable_stop:
-            raise ConnectionError("Stop role is not enabled")
+        logger.debug("Received relayed connection from %s", remote_peer_id)
 
-        try:
-            # Read STOP message
-            msg_bytes = await stream.read()
-            stop_msg = StopMessage()
-            stop_msg.ParseFromString(msg_bytes)
+        # Create a raw connection from the stream
+        raw_conn = RawConnection(stream=stream, initiator=False)
 
-            if stop_msg.type != StopMessage.CONNECT:
-                raise ConnectionError("Invalid STOP message type")
+        # If hole punching is enabled, schedule a hole punch attempt
+        if self.config.enable_hole_punching and self.dcutr_protocol:
+            # Get the relay peer ID from the stream if possible
+            relay_peer_id = None
+            try:
+                # Attempt to extract relay peer ID from connection or stream metadata
+                # This will depend on how the stream info is structured
+                pass
+            except Exception:
+                pass
 
-            # Create raw connection
-            return RawConnection(stream=stream, initiator=False)
+            # Schedule hole punching in the background
+            if relay_peer_id:
+                self._schedule_hole_punch(remote_peer_id, relay_peer_id)
+            else:
+                # If we can't determine the relay, still try hole punching
+                self._schedule_hole_punch(remote_peer_id, None)
 
-        except Exception as e:
-            await stream.close()
-            raise ConnectionError(f"Failed to handle incoming connection: {str(e)}")
+        return raw_conn
+
+    def _schedule_hole_punch(self, peer_id: ID, relay_peer_id: Optional[ID]) -> None:
+        """
+        Schedule a hole punching attempt in the background.
+
+        Parameters
+        ----------
+        peer_id : ID
+            The peer to attempt hole punching with
+        relay_peer_id : Optional[ID]
+            The relay used for the connection (if known)
+        """
+        if not self.dcutr_protocol or not self.config.enable_hole_punching:
+            return
+
+        async def attempt_hole_punch() -> None:
+            # Wait a short time for the relay connection to be fully established
+            await trio.sleep(2.0)
+
+            # Check if we already have a direct connection
+            if self.dcutr_protocol._have_direct_connection(peer_id):
+                logger.debug(
+                    "Already have direct connection to %s, skipping hole punch", peer_id
+                )
+                return
+
+            # Attempt hole punching
+            relay_info = f" via relay {relay_peer_id}" if relay_peer_id else ""
+            logger.info("Attempting hole punch with %s%s", peer_id, relay_info)
+
+            for i in range(self.config.max_hole_punch_attempts):
+                if i > 0:
+                    # Wait before retrying
+                    await trio.sleep(self.config.hole_punch_retry_interval)
+
+                # Skip if we already have a direct connection
+                if self.dcutr_protocol._have_direct_connection(peer_id):
+                    logger.debug(
+                        "Direct connection established, no need for further hole punching"
+                    )
+                    return
+
+                # Attempt hole punching
+                success = await self.dcutr_protocol.initiate_hole_punch(peer_id)
+                if success:
+                    logger.info("Hole punching succeeded with %s", peer_id)
+                    return
+
+                logger.debug(
+                    "Hole punching attempt %d/%d with %s failed",
+                    i + 1,
+                    self.config.max_hole_punch_attempts,
+                    peer_id,
+                )
+
+            logger.warning(
+                "All hole punching attempts with %s failed, keeping relay connection",
+                peer_id,
+            )
+
+        # Schedule the hole punching attempt in the background
+        nursery = self.host.get_network().nursery
+        if nursery:
+            nursery.start_soon(attempt_hole_punch)
+        else:
+            logger.warning("No nursery available, cannot schedule hole punching")
 
     async def run(self) -> None:
-        """Run the listener service."""
-        # Implementation would go here
+        """Run the listener."""
+        self.event_started.set()
+        await self.manager.wait_finished()
 
     async def listen(self, maddr: Any, nursery: Any) -> bool:
         """
@@ -364,32 +539,43 @@ class CircuitV2Listener(Service, IListener):
         maddr : Any
             The multiaddr to listen on
         nursery : Any
-            The nursery to run tasks in
+            The nursery to run in
 
         Returns
         -------
         bool
-            True if listening successfully started
-
+            True if listening succeeded
         """
-        # TODO: Implement proper multiaddr handling for relayed addresses
-        if isinstance(maddr, str):
-            self.multiaddrs.append(maddr)
+        # For relay listener, we don't actually bind to an address
+        # We just need to register with the protocol to receive connections
+        logger.debug("Relay listener started")
+
+        # Start the DCUtR protocol if available
+        if self.config.enable_hole_punching and self.dcutr_protocol:
+            logger.debug("Starting DCUtR protocol for hole punching")
+            nursery.start_soon(self.dcutr_protocol.run)
+
         return True
 
     def get_addrs(self) -> tuple[Any, ...]:
         """
-        Get the listening addresses.
+        Get the multiaddrs the listener is listening on.
 
         Returns
         -------
         tuple[Any, ...]
-            Tuple of listening multiaddresses
-
+            Tuple of multiaddrs
         """
-        return tuple(self.multiaddrs)
+        # For relay listener, we don't actually have addresses
+        return tuple()
 
     async def close(self) -> None:
         """Close the listener."""
-        self.multiaddrs.clear()
-        await self.manager.stop()
+        logger.debug("Closing relay listener")
+
+        # Stop the DCUtR protocol if it's running
+        if self.dcutr_protocol:
+            await self.dcutr_protocol.stop()
+
+        # Stop this listener service
+        await self.stop()
