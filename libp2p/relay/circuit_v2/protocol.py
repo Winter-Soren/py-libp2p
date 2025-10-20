@@ -491,7 +491,8 @@ class CircuitV2Protocol(Service):
                 try:
                     while True:
                         # Read application data forwarded by the relay
-                        data = await stream.read()
+                        # Use buffered read to prevent blocking on open streams
+                        data = await stream.read(16384)
                         if not data:
                             logger.debug("STOP stream closed by remote peer")
                             break
