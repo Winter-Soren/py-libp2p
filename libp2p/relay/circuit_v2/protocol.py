@@ -37,6 +37,10 @@ from libp2p.stream_muxer.mplex.exceptions import (
 from libp2p.tools.async_service import (
     Service,
 )
+from libp2p.utils import (
+    encode_varint_prefixed,
+    read_varint_prefixed_bytes,
+)
 
 from .config import (
     DEFAULT_MAX_CIRCUIT_BYTES,
@@ -248,11 +252,17 @@ class CircuitV2Protocol(Service):
                 with trio.fail_after(self.read_timeout):
                     # Try reading with timeout
                     logger.debug(
-                        "Attempting to read from stream (attempt %d/%d)",
+                        "Attempting to read from stream %s (stream_id=%s, attempt %d/%d)",
+                        stream,
+                        getattr(stream, 'stream_id', 'N/A'),
                         retries + 1,
                         max_retries,
                     )
-                    data = await stream.read()
+                    logger.debug("Calling stream.read() with buffer size 16384...")
+                    # Read with a buffer size instead of reading all (-1)
+                    # This prevents blocking when waiting for FIN on streams that are still open
+                    data = await stream.read(16384)
+                    logger.debug("stream.read() returned: %s bytes", len(data) if data else 0)
                     if not data:  # EOF
                         logger.debug("Stream EOF detected")
                         return None
@@ -309,9 +319,8 @@ class CircuitV2Protocol(Service):
         try:
             # Try to get peer ID first
             try:
-                # Cast to extended interface with get_remote_peer_id
-                stream_with_peer_id = cast(INetStreamWithExtras, stream)
-                remote_peer_id = stream_with_peer_id.get_remote_peer_id()
+                # Get remote peer ID from muxed connection
+                remote_peer_id = stream.muxed_conn.peer_id
                 remote_id = str(remote_peer_id)
             except Exception:
                 # Fall back to address if peer ID not available
@@ -323,9 +332,12 @@ class CircuitV2Protocol(Service):
             # Handle multiple messages on the same stream with proper timeout handling
             while True:
                 # Read message with timeout
+                logger.debug("=== HOP STREAM WHILE LOOP: About to read next message from %s ===", remote_id)
                 try:
                     with trio.fail_after(STREAM_READ_TIMEOUT):
-                        msg_bytes = await stream.read()
+                        logger.debug("=== HOP STREAM: Calling read_varint_prefixed_bytes ===")
+                        msg_bytes = await read_varint_prefixed_bytes(stream)
+                        logger.debug("=== HOP STREAM: read_varint_prefixed_bytes returned %d bytes ===", len(msg_bytes) if msg_bytes else 0)
                         if not msg_bytes:
                             logger.debug("Stream closed by peer %s", remote_id)
                             return
@@ -360,8 +372,11 @@ class CircuitV2Protocol(Service):
                     # Continue reading for more messages
                 elif hop_msg.type == HopMessage.CONNECT:
                     logger.debug("Handling CONNECT message from %s", remote_id)
+                    logger.debug("=== ABOUT TO CALL _handle_connect (will block in nursery) ===")
                     await self._handle_connect(stream, hop_msg)
+                    logger.debug("=== _handle_connect RETURNED (nursery completed) ===")
                     # CONNECT establishes a circuit, so we're done with this stream
+                    logger.debug("=== RETURNING FROM _handle_hop_stream ===")
                     return
                 else:
                     logger.error(
@@ -395,14 +410,19 @@ class CircuitV2Protocol(Service):
 
         This handler processes incoming relay connections from the destination side.
         """
+        logger.debug("=== STOP STREAM HANDLER CALLED ===")
         try:
             # Read the incoming message with timeout
+            logger.debug("Reading STOP message from stream...")
             with trio.fail_after(self.read_timeout):
-                msg_bytes = await stream.read()
+                msg_bytes = await read_varint_prefixed_bytes(stream)
+                logger.debug("Received STOP message: %d bytes", len(msg_bytes))
                 stop_msg = StopMessage()
                 stop_msg.ParseFromString(msg_bytes)
+                logger.debug("Parsed STOP message | type=%s", stop_msg.type)
 
             if stop_msg.type != StopMessage.CONNECT:
+                logger.error("Invalid STOP message type: %s", stop_msg.type)
                 # Use direct attribute access to create status object for error response
                 await self._send_stop_status(
                     stream,
@@ -412,49 +432,87 @@ class CircuitV2Protocol(Service):
                 await self._close_stream(stream)
                 return
 
-            # Get the source stream from active relays
+            # Get the source stream from active relays (if this is a relay node)
             peer_id = ID(stop_msg.peer)
-            if peer_id not in self._active_relays:
-                # Use direct attribute access to create status object for error response
+            logger.debug("STOP CONNECT request for source peer %s", peer_id)
+
+            # Check if we have state - this distinguishes between relay and destination nodes
+            if peer_id in self._active_relays:
+                # This is a relay node with pending connection state
+                logger.debug("Found active relay for peer %s, updating with destination stream", peer_id)
+                src_stream, _ = self._active_relays[peer_id]
+                self._active_relays[peer_id] = (src_stream, stream)
+
+                # Send success status to both sides
+                logger.debug("Sending OK status to source stream")
+                await self._send_status(
+                    src_stream,
+                    StatusCode.OK,
+                    "Connection established",
+                )
+                logger.debug("Sending OK status to destination (STOP) stream")
                 await self._send_stop_status(
                     stream,
-                    StatusCode.CONNECTION_FAILED,
-                    "No pending relay connection",
+                    StatusCode.OK,
+                    "Connection established",
                 )
-                await self._close_stream(stream)
-                return
+                logger.debug("Both status messages sent, starting data relay")
 
-            src_stream, _ = self._active_relays[peer_id]
-            self._active_relays[peer_id] = (src_stream, stream)
-
-            # Send success status to both sides
-            await self._send_status(
-                src_stream,
-                StatusCode.OK,
-                "Connection established",
-            )
-            await self._send_stop_status(
-                stream,
-                StatusCode.OK,
-                "Connection established",
-            )
-
-            # Start relaying data
-            async with trio.open_nursery() as nursery:
-                nursery.start_soon(
-                    self._relay_data,
-                    src_stream,
+                # Start relaying data
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(
+                        self._relay_data,
+                        src_stream,
+                        stream,
+                        peer_id,
+                        Pipe.SRC_TO_DST,
+                    )
+                    nursery.start_soon(
+                        self._relay_data,
+                        stream,
+                        src_stream,
+                        peer_id,
+                        Pipe.DST_TO_SRC,
+                    )
+            else:
+                # This is a destination node - accept the connection and handle application data
+                # The relay will forward data from the source through this STOP stream
+                logger.debug("Accepting STOP CONNECT as destination node (no prior state)")
+                await self._send_stop_status(
                     stream,
-                    peer_id,
-                    Pipe.SRC_TO_DST,
+                    StatusCode.OK,
+                    "Connection accepted",
                 )
-                nursery.start_soon(
-                    self._relay_data,
-                    stream,
-                    src_stream,
-                    peer_id,
-                    Pipe.DST_TO_SRC,
-                )
+                logger.debug("STOP stream accepted, waiting for application data from relay")
+
+                # Handle application data from the relay
+                # The relay forwards: source writes → relay reads → relay writes to this stream
+                # We read the data and send responses back through the same stream
+                try:
+                    while True:
+                        # Read application data forwarded by the relay
+                        data = await stream.read()
+                        if not data:
+                            logger.debug("STOP stream closed by remote peer")
+                            break
+
+                        # Log received application data
+                        logger.info(
+                            "Received application data via relay (%d bytes): %s",
+                            len(data),
+                            data.decode(errors="ignore"),
+                        )
+
+                        # Send application response back through the relay
+                        local_peer_id = self.host.get_id()
+                        response = f"Hello from {local_peer_id} (via relay)!".encode()
+                        logger.debug("Sending %d byte response through relay", len(response))
+                        await stream.write(response)
+                        logger.info("Sent response through relay")
+                except Exception as e:
+                    logger.debug("STOP stream ended: %s", str(e))
+                finally:
+                    await self._close_stream(stream)
 
         except trio.TooSlowError:
             logger.error("Timeout reading from stop stream")
@@ -496,7 +554,7 @@ class CircuitV2Protocol(Service):
                     type=HopMessage.STATUS,
                     status=status.to_pb(),
                 )
-                await stream.write(status_msg.SerializeToString())
+                await stream.write(encode_varint_prefixed(status_msg.SerializeToString()))
                 return
 
             # Accept reservation
@@ -532,7 +590,7 @@ class CircuitV2Protocol(Service):
                 )
 
                 # Send the response
-                await stream.write(response.SerializeToString())
+                await stream.write(encode_varint_prefixed(response.SerializeToString()))
                 logger.debug("Reservation response sent successfully")
 
         except Exception as e:
@@ -547,14 +605,8 @@ class CircuitV2Protocol(Service):
                     )
                 except Exception as send_err:
                     logger.error("Failed to send error response: %s", str(send_err))
-        finally:
-            # Always close the stream when done with reservation
-            if cast(INetStreamWithExtras, stream).is_open():
-                try:
-                    with trio.fail_after(STREAM_CLOSE_TIMEOUT):
-                        await stream.close()
-                except Exception as close_err:
-                    logger.error("Error closing stream: %s", str(close_err))
+        # NOTE: We do NOT close the stream here because the client may send
+        # a CONNECT message on the same stream after receiving the reservation response
 
     async def _handle_connect(self, stream: INetStream, msg: Any) -> None:
         """Handle a connect request."""
@@ -574,7 +626,25 @@ class CircuitV2Protocol(Service):
                 return
 
         # Check resource limits
-        if not self.resource_manager.can_accept_connection(peer_id):
+        # If no reservation exists, create an implicit one to allow the connection
+        # This supports the current transport behavior which doesn't make RESERVE requests yet
+        reservation = self.resource_manager._reservations.get(peer_id)
+        if reservation is None:
+            # Create implicit reservation if we're under the limit
+            if self.resource_manager.can_accept_reservation(peer_id):
+                reservation = self.resource_manager.create_reservation(peer_id)
+                logger.debug("Created implicit reservation for peer %s", peer_id)
+            else:
+                await self._send_status(
+                    stream,
+                    StatusCode.RESOURCE_LIMIT_EXCEEDED,
+                    "Reservation limit exceeded",
+                )
+                await stream.reset()
+                return
+
+        # Now check if the reservation can accept the connection
+        if not reservation.can_accept_connection():
             await self._send_status(
                 stream,
                 StatusCode.RESOURCE_LIMIT_EXCEEDED,
@@ -597,19 +667,22 @@ class CircuitV2Protocol(Service):
                 logger.debug("Successfully connected to destination %s", peer_id)
 
                 # Send STOP CONNECT message
+                source_peer_id = stream.muxed_conn.peer_id
                 stop_msg = StopMessage(
                     type=StopMessage.CONNECT,
-                    # Cast to extended interface with get_remote_peer_id
-                    peer=cast(INetStreamWithExtras, stream)
-                    .get_remote_peer_id()
-                    .to_bytes(),
+                    peer=source_peer_id.to_bytes(),
                 )
-                await dst_stream.write(stop_msg.SerializeToString())
+                logger.debug("Sending STOP CONNECT message to destination | source_peer=%s", source_peer_id)
+                await dst_stream.write(encode_varint_prefixed(stop_msg.SerializeToString()))
+                logger.debug("STOP CONNECT message sent, waiting for response...")
 
                 # Wait for response from destination
-                resp_bytes = await dst_stream.read()
+                logger.debug("Reading response from destination...")
+                resp_bytes = await read_varint_prefixed_bytes(dst_stream)
+                logger.debug("Received response from destination: %d bytes", len(resp_bytes))
                 resp = StopMessage()
                 resp.ParseFromString(resp_bytes)
+                logger.debug("Parsed STOP response from destination")
 
                 # Handle status attributes from the response
                 if resp.HasField("status"):
@@ -643,7 +716,11 @@ class CircuitV2Protocol(Service):
             )
 
             # Start relaying data
+            logger.debug("=== STARTING DATA RELAY NURSERY ===")
+            logger.debug("SRC_STREAM: %s (stream_id=%s)", stream, getattr(stream, 'stream_id', 'N/A'))
+            logger.debug("DST_STREAM: %s (stream_id=%s)", dst_stream, getattr(dst_stream, 'stream_id', 'N/A'))
             async with trio.open_nursery() as nursery:
+                logger.debug("=== NURSERY OPENED, STARTING TASKS ===")
                 nursery.start_soon(
                     self._relay_data,
                     stream,
@@ -674,8 +751,11 @@ class CircuitV2Protocol(Service):
             if reservation:
                 reservation.active_connections -= 1
             await stream.reset()
-            if dst_stream and not cast(INetStreamWithExtras, dst_stream).is_closed():
-                await dst_stream.reset()
+            if dst_stream:
+                try:
+                    await dst_stream.reset()
+                except Exception:
+                    pass  # Stream may already be closed
         except Exception as e:
             logger.error("Unexpected error in connect handler: %s", str(e))
             await self._send_status(
@@ -686,8 +766,11 @@ class CircuitV2Protocol(Service):
             if peer_id in self._active_relays:
                 del self._active_relays[peer_id]
             await stream.reset()
-            if dst_stream and not cast(INetStreamWithExtras, dst_stream).is_closed():
-                await dst_stream.reset()
+            if dst_stream:
+                try:
+                    await dst_stream.reset()
+                except Exception:
+                    pass  # Stream may already be closed
 
     async def _relay_data(
         self,
@@ -712,18 +795,26 @@ class CircuitV2Protocol(Service):
             Direction of data flow (``Pipe.SRC_TO_DST`` or ``Pipe.DST_TO_SRC``)
 
         """
+        logger.debug("=== _RELAY_DATA TASK STARTED: %s ===", direction.name)
+        logger.debug("[%s] SRC_STREAM: %s (stream_id=%s)", direction.name, src_stream, getattr(src_stream, 'stream_id', 'N/A'))
+        logger.debug("[%s] DST_STREAM: %s (stream_id=%s)", direction.name, dst_stream, getattr(dst_stream, 'stream_id', 'N/A'))
         try:
+            logger.debug("Entering relay loop for %s", direction.name)
             while True:
                 # Read data with retries
+                logger.debug("[%s] About to call _read_stream_with_retry", direction.name)
                 data = await self._read_stream_with_retry(src_stream)
+                logger.debug("[%s] _read_stream_with_retry returned: %s bytes", direction.name, len(data) if data else 0)
                 if not data:
                     logger.info("%s closed/reset", direction.name)
                     break
 
                 # Write data with timeout
                 try:
+                    logger.debug("[%s] Writing %d bytes to destination stream", direction.name, len(data))
                     with trio.fail_after(self.write_timeout):
                         await dst_stream.write(data)
+                    logger.debug("[%s] Successfully wrote %d bytes", direction.name, len(data))
                 except trio.TooSlowError:
                     logger.error("Timeout writing in %s", direction.name)
                     break
@@ -775,7 +866,7 @@ class CircuitV2Protocol(Service):
                 msg_bytes = status_msg.SerializeToString()
                 logger.debug("Status message serialized (%d bytes)", len(msg_bytes))
 
-                await stream.write(msg_bytes)
+                await stream.write(encode_varint_prefixed(msg_bytes))
                 logger.debug("Status message sent successfully")
         except trio.TooSlowError:
             logger.error(
@@ -805,6 +896,6 @@ class CircuitV2Protocol(Service):
                     type=StopMessage.STATUS,
                     status=pb_status,
                 )
-                await stream.write(status_msg.SerializeToString())
+                await stream.write(encode_varint_prefixed(status_msg.SerializeToString()))
         except Exception as e:
             logger.error("Error sending stop status message: %s", str(e))

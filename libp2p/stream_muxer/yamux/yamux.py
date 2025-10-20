@@ -232,9 +232,13 @@ class YamuxStream(IMuxedStream):
                     raise MuxedStreamReset("Stream was reset")
 
                 # Wait for more data or stream closure
-                logger.debug(f"Stream {self.stream_id}: Waiting for data or FIN")
-                await self.conn.stream_events[self.stream_id].wait()
-                self.conn.stream_events[self.stream_id] = trio.Event()
+                event_before = self.conn.stream_events[self.stream_id]
+                logger.debug(f"Stream {self.stream_id}: Waiting for data or FIN | event={id(event_before)}")
+                await event_before.wait()
+                logger.debug(f"Stream {self.stream_id}: WOKE UP from wait | event={id(event_before)}")
+                new_event = trio.Event()
+                logger.debug(f"Stream {self.stream_id}: Creating new event | old={id(event_before)}, new={id(new_event)}")
+                self.conn.stream_events[self.stream_id] = new_event
 
             # After loop exit, first check if we have data to return
             if data:
@@ -523,10 +527,14 @@ class Yamux(IMuxedConn):
                     raise MuxedStreamEOF("Stream is closed for receiving")
 
             # Wait for data if stream is still open
-            logger.debug(f"Waiting for data on stream {self.peer_id}:{stream_id}")
+            event_before = self.stream_events[stream_id]
+            logger.debug(f"Waiting for data on stream {self.peer_id}:{stream_id} | event={id(event_before)}")
             try:
-                await self.stream_events[stream_id].wait()
-                self.stream_events[stream_id] = trio.Event()
+                await event_before.wait()
+                logger.debug(f"Stream {self.peer_id}:{stream_id} WOKE UP | event={id(event_before)}")
+                new_event = trio.Event()
+                logger.debug(f"Stream {self.peer_id}:{stream_id}: Creating new event | old={id(event_before)}, new={id(new_event)}")
+                self.stream_events[stream_id] = new_event
             except KeyError:
                 raise MuxedStreamEOF("Stream was removed")
 
@@ -645,7 +653,12 @@ class Yamux(IMuxedConn):
                         async with self.streams_lock:
                             if stream_id in self.streams:
                                 self.stream_buffers[stream_id].extend(data)
-                                self.stream_events[stream_id].set()
+                                event_to_set = self.stream_events[stream_id]
+                                logger.debug(
+                                    f"Stream {stream_id}: SETTING EVENT after receiving {len(data)} bytes | "
+                                    f"event={id(event_to_set)}, buffer_len={len(self.stream_buffers[stream_id])}"
+                                )
+                                event_to_set.set()
                                 if flags & FLAG_FIN:
                                     logger.debug(
                                         f"Received FIN for stream {self.peer_id}:"

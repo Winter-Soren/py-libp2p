@@ -30,6 +30,10 @@ from libp2p.peer.peerinfo import (
 from libp2p.tools.async_service import (
     Service,
 )
+from libp2p.utils import (
+    encode_varint_prefixed,
+    read_varint_prefixed_bytes,
+)
 
 from .config import (
     ClientConfig,
@@ -179,33 +183,43 @@ class CircuitV2Transport(ITransport):
             )
 
         try:
-            # First try to make a reservation if enabled
-            if self.config.enable_client:
-                success = await self._make_reservation(relay_stream, relay_peer_id)
-                if not success:
-                    logger.warning(
-                        "Failed to make reservation with relay %s", relay_peer_id
-                    )
+            # NOTE: Reservations should be made separately, not on the same stream as CONNECT
+            # For now, we'll just send CONNECT directly
+            # TODO: Implement proper reservation management with periodic refresh
 
             # Send HOP CONNECT message
+            logger.debug("=== SENDING CONNECT MESSAGE ===")
             hop_msg = HopMessage(
                 type=HopMessage.CONNECT,
                 peer=peer_info.peer_id.to_bytes(),
             )
-            await relay_stream.write(hop_msg.SerializeToString())
+            logger.debug("CONNECT message type: %s", hop_msg.type)
+            logger.debug("CONNECT to peer: %s", peer_info.peer_id)
+
+            await relay_stream.write(encode_varint_prefixed(hop_msg.SerializeToString()))
+            logger.debug("CONNECT message sent, waiting for response...")
 
             # Read response with timeout
+            logger.debug("=== WAITING FOR CONNECT RESPONSE ===")
             with trio.fail_after(STREAM_READ_TIMEOUT):
-                resp_bytes = await relay_stream.read()
+                resp_bytes = await read_varint_prefixed_bytes(relay_stream)
+                logger.debug("Received CONNECT response: %d bytes", len(resp_bytes))
                 resp = HopMessage()
                 resp.ParseFromString(resp_bytes)
+                logger.debug("=== PARSED CONNECT RESPONSE ===")
+                logger.debug("Response message type: %s", resp.type)
 
             # Access status attributes directly
             status_code = getattr(resp.status, "code", StatusCode.OK)
             status_msg = getattr(resp.status, "message", "Unknown error")
 
+            logger.debug("CONNECT response: code=%s, message=%s", status_code, status_msg)
+
             if status_code != StatusCode.OK:
+                logger.error("Relay connection failed with status %s: %s", status_code, status_msg)
                 raise ConnectionError(f"Relay connection failed: {status_msg}")
+
+            logger.debug("CONNECT successful, creating RawConnection")
 
             # Create raw connection from stream
             return RawConnection(stream=relay_stream, initiator=True)
@@ -278,7 +292,7 @@ class CircuitV2Transport(ITransport):
             logger.debug("Raw message: %s", reserve_msg)
 
             try:
-                await stream.write(reserve_msg.SerializeToString())
+                await stream.write(encode_varint_prefixed(reserve_msg.SerializeToString()))
                 logger.debug("Successfully sent reservation request")
             except Exception as e:
                 logger.error("Failed to send reservation request: %s", str(e))
@@ -288,7 +302,7 @@ class CircuitV2Transport(ITransport):
             logger.debug("=== WAITING FOR RESERVATION RESPONSE ===")
             with trio.fail_after(STREAM_READ_TIMEOUT):
                 try:
-                    resp_bytes = await stream.read()
+                    resp_bytes = await read_varint_prefixed_bytes(stream)
                     logger.debug(
                         "Received reservation response: %d bytes", len(resp_bytes)
                     )
@@ -415,7 +429,7 @@ class CircuitV2Listener(Service, IListener):
 
         try:
             # Read STOP message
-            msg_bytes = await stream.read()
+            msg_bytes = await read_varint_prefixed_bytes(stream)
             stop_msg = StopMessage()
             stop_msg.ParseFromString(msg_bytes)
 
